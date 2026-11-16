@@ -580,7 +580,7 @@ def build_timeline(sections, intro_narration, paragraph_narrations):
             break
         # The OUTRO is audio-only: do not show its heading or reserve
         # heading-screen time. The existing paragraph pause is preserved.
-        is_outro_section = section['heading'].strip().casefold() == 'outro'
+        is_outro_section = section['heading'].strip().casefold() == 'OUTRO'
         if not is_outro_section:
             add_word_overlay(overlays, section['heading'], current_time,
                              SECTION_HEADING_SECONDS, is_heading=True)
@@ -769,6 +769,7 @@ def main():
 
 
 if __name__ == '__main__':
+    # print(*parse_story(SCRIPT_PATH), sep = "\n\n")
     if len(sys.argv) == 5 and sys.argv[1] == '--render-segment':
         render_video_segment(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]))
     else:
