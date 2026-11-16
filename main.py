@@ -765,7 +765,7 @@ def main():
 
     print(f'Finished: {OUTPUT_PATH}', flush=True)
     print(f'Temporary segments preserved at: {temp_dir}', flush=True)
-    # shutil.rmtree(temp_dir)
+    shutil.rmtree(temp_dir)
 
 
 if __name__ == '__main__':
