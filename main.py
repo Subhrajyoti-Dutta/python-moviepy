@@ -1,36 +1,18 @@
-"""Reddit story video builder (MoviePy 2.x).
-
-Install: pip install moviepy pillow numpy
-
-Script format in assets/story.txt:
-    SECTION 1: My old company
-
-    First paragraph of this section.
-
-    Second paragraph of this section.
-
-    SECTION 2: The problem
-
-    First paragraph of section two.
-
-One narration file per PARAGRAPH in reading order across all sections:
-assets/audios/audio1.m4a, audio2.m4a, etc. Each paragraph is displayed
-for the exact duration of its corresponding narration file.
-"""
 from pathlib import Path
+import os
 import re
 import subprocess
 import sys
-import os
-import shutil
+import json
+import math
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import imageio_ffmpeg
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from moviepy import (AudioFileClip, VideoFileClip, VideoClip, ImageClip, ColorClip, CompositeVideoClip,
-                     CompositeAudioClip, concatenate_videoclips)
-from moviepy.video.fx import Loop
+from moviepy import (AudioFileClip, VideoClip, ImageClip, CompositeVideoClip,
+                     CompositeAudioClip)
 
 PROJECT_DIRECTORY = Path(__file__).resolve().parent
 ASSETS_DIRECTORY = PROJECT_DIRECTORY / 'assets'
@@ -40,34 +22,29 @@ ICON_DIRECTORY = ASSETS_DIRECTORY / 'icons'
 SCRIPT_PATH = ASSETS_DIRECTORY / 'story.txt'
 OUTPUT_PATH = PROJECT_DIRECTORY / 'output.mp4'
 
-RESOLUTION = "240p"
+RESOLUTION = "1080p"
 VIDEO_SIZE = (int(RESOLUTION[:-1]) * 16 // 9, int(RESOLUTION[:-1]))
 REFERENCE_SIZE = (1920, 1080)
 VIDEO_FPS = 30
-# Independent FFmpeg/Python worker processes; 2 is safer on low-RAM laptops.
 PARALLEL_RENDER_WORKERS = 8
-# Chunk length in seconds; all cuts are aligned to output frames.
 RENDER_CHUNK_SECONDS = 90
-# Each worker runs its own encoder. Too many threads per worker can slow rendering.
-ENCODER_THREADS_PER_WORKER = 2
+ENCODER_THREADS_PER_WORKER = 1
 BACKGROUND_CROSSFADE_SECONDS = 1.0
-# Avoid MoviePy requesting the nonexistent end-boundary frame of source videos.
 BACKGROUND_END_TRIM_FRAMES = 3
 
-# Vertical ascent transitions (1920 x 1080 reference pixels).
 TRANSITION_IN_SECONDS = 0.50
 TRANSITION_OUT_SECONDS = 0.40
 TRANSITION_DISTANCE = 75
 WORD_STAGGER_SECONDS = 0.06
 WORD_ASCENT_SECONDS = 0.375
 WORD_EXIT_SECONDS = 0.35
-INTRO_PAUSE_SECONDS = 1.0
+INTRO_PAUSE_SECONDS = 0.5
 SECTION_HEADING_SECONDS = 2.0
-PARAGRAPH_PAUSE_SECONDS = 1.0  # Silence between paragraphs and before the next section
+PARAGRAPH_PAUSE_SECONDS = 0.5  
 
 SUBREDDIT_NAME = 'r/ProRevenge'
 AUTHOR_USERNAME = 'u/RedditStories'
-STORY_TITLE = 'My Coworker Got Me Fired Over $5,000. Years Later, I Got My Revenge.'
+STORY_TITLE = open("./assets/story.txt","r").read().split("\n")[0][:-1]
 
 FONT_PATHS = {
     True: ['C:/Windows/Fonts/arialbd.ttf', '/usr/share/fonts/truetype/msttcorefonts/Arial_Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'],
@@ -114,7 +91,7 @@ def wrap_text(draw_context, text, text_font, maximum_width):
 def create_canvas():
     if abs(VIDEO_SIZE[0] / VIDEO_SIZE[1] - 16 / 9) > 0.01:
         raise ValueError('VIDEO_SIZE must have a 16:9 aspect ratio')
-    # Draw at native output resolution, never supersample every overlay.
+    
     canvas = Image.new('RGBA', VIDEO_SIZE, (0, 0, 0, 0))
     return canvas, ImageDraw.Draw(canvas), VIDEO_SIZE[0] / REFERENCE_SIZE[0]
 
@@ -182,72 +159,16 @@ def create_intro_card(*, background=True, elements=True, title=True):
     return render_overlay(paint)
 
 
-# Clipchamp-style narration overlays (reference coordinates: 1920 x 1080).
-# The Reddit-style white card is used ONLY for the introduction.
-STORY_DARKEN_ALPHA = 80  # Applied continuously from the first frame through the last.
+
+
+STORY_DARKEN_ALPHA = 80  
 STORY_TEXT_MARGIN = 123
 STORY_HEADING_FONT_SIZE = 75
 STORY_PARAGRAPH_FONT_SIZE = 63
 
 
-def create_story_card(text, *, is_heading=False):
-    """White Arial text directly on subtly darkened footage; no card or border.
-
-    Headings are uppercase and center-aligned. Paragraphs are bold,
-    left-aligned within a horizontally centered block. Both text blocks
-    are vertically centered, matching the supplied Clipchamp screenshots.
-    """
-    def paint(canvas, draw_context, render_scale):
-        def scale(value):
-            return round(value * render_scale)
-
-        # A full-frame transparent tint improves readability while allowing
-        # the background footage to remain visible and continuously moving.
-        draw_context.rectangle(
-            (0, 0, canvas.width, canvas.height),
-            fill=(0, 0, 0, STORY_DARKEN_ALPHA),
-        )
-
-        if not text.strip():
-            return
-        display_text = text.upper() if is_heading else text
-        max_width = 1650 if is_heading else REFERENCE_SIZE[0] - 2 * STORY_TEXT_MARGIN
-        font_size = STORY_HEADING_FONT_SIZE if is_heading else STORY_PARAGRAPH_FONT_SIZE
-        max_height = 870
-
-        while font_size >= 33:
-            font = load_font(scale(font_size), bold=True)
-            lines = wrap_text(draw_context, display_text, font, scale(max_width))
-            line_spacing = font_size * (1.25 if is_heading else 1.30)
-            # Measure visible glyph bounds to center the complete text block.
-            line_heights = [
-                draw_context.textbbox((0, 0), line, font=font, anchor='lt')[3]
-                / render_scale for line in lines
-            ]
-            text_height = (len(lines) - 1) * line_spacing + max(line_heights, default=0)
-            if text_height <= max_height:
-                break
-            font_size -= 3
-        else:
-            raise ValueError(f'Text is too long to fit on screen: {display_text[:80]!r}')
-
-        text_top = (REFERENCE_SIZE[1] - text_height) / 2
-        for index, line in enumerate(lines):
-            if is_heading:
-                line_width = draw_context.textbbox((0, 0), line, font=font)[2] / render_scale
-                text_left = (REFERENCE_SIZE[0] - line_width) / 2
-            else:
-                text_left = STORY_TEXT_MARGIN
-            draw_context.text(
-                (scale(text_left), scale(text_top + index * line_spacing)),
-                line, font=font, fill='white', anchor='lt',
-            )
-
-    return render_overlay(paint)
-
-
 def word_layout(text, *, is_heading=False, intro_title=False):
-    """Lay out word sprites ONCE at output resolution (no 3x supersampling)."""
+    
     sx = VIDEO_SIZE[0] / REFERENCE_SIZE[0]
     sy = VIDEO_SIZE[1] / REFERENCE_SIZE[1]
     measure = ImageDraw.Draw(Image.new('RGB', (1, 1)))
@@ -292,9 +213,9 @@ def word_layout(text, *, is_heading=False, intro_title=False):
             raise ValueError(f'Text is too long to fit: {display[:80]!r}')
         top, left = (1080 - height) / 2, STORY_TEXT_MARGIN
 
-    # All words on a line must share ONE font baseline. Using anchor='lt'
-    # independently for each word makes words with different glyph heights
-    # (e.g. "any", "A", "company") jump vertically.
+    
+    
+    
     reference_top = measure.textbbox(
         (0, 0), 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
         font=font, anchor='ls'
@@ -308,8 +229,8 @@ def word_layout(text, *, is_heading=False, intro_title=False):
         line_top = (top + line_index * spacing) * sy
         for word in line.split():
             bbox = measure.textbbox((0, 0), word, font=font, anchor='ls')
-            # Draw the glyph into a tight sprite while retaining its offset
-            # from the common baseline, including descenders and ascenders.
+            
+            
             sprite = Image.new('RGBA',
                                (max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])),
                                (0, 0, 0, 0))
@@ -323,11 +244,11 @@ def word_layout(text, *, is_heading=False, intro_title=False):
 
 
 def add_word_overlay(overlays, text, start_time, duration, *, is_heading=False, intro_title=False):
-    """Staggered words, rendered only during transitions; static middle is reused.
-
-    No full-resolution supersampling, no LANCZOS resize on each frame, and
-    no Pillow work while text is stationary. RGB and alpha share a cache.
-    """
+    
+    
+    
+    
+    
     if duration <= 0:
         return
     words = word_layout(text, is_heading=is_heading, intro_title=intro_title)
@@ -342,9 +263,9 @@ def add_word_overlay(overlays, text, start_time, duration, *, is_heading=False, 
     exit_time = min(WORD_EXIT_SECONDS, duration * 0.25)
     distance = round(TRANSITION_DISTANCE * VIDEO_SIZE[1] / REFERENCE_SIZE[1])
 
-    # Crop the animated overlay to its actual text bounds. Previously every
-    # paragraph allocated/composited a full 1920x1080 RGBA frame on every
-    # transition frame, even though most pixels were transparent.
+    
+    
+    
     left = max(0, min(x for sprite, x, y in words))
     top = max(0, min(y for sprite, x, y in words) - distance - 2)
     right = min(VIDEO_SIZE[0], max(x + sprite.width for sprite, x, y in words) + 2)
@@ -399,7 +320,7 @@ def add_word_overlay(overlays, text, start_time, duration, *, is_heading=False, 
 
 
 def parse_story(script_path):
-    """Requires explicit SECTION N: Heading lines and blank-line-separated paragraphs."""
+    
     if not script_path.is_file():
         raise FileNotFoundError(f'Create {script_path} with SECTION 1: Heading followed by paragraphs')
     script = script_path.read_text(encoding='utf-8-sig').replace('\r\n', '\n')
@@ -424,109 +345,23 @@ def parse_story(script_path):
     return sections
 
 
-def open_background_video(video_path):
-    """Open a background clip, removing unsupported data tracks if necessary.
-
-    The original video is never changed. A video-only MP4 is cached beside the
-    project in .moviepy_cache when MoviePy cannot parse the original metadata.
-    """
-    try:
-        return VideoFileClip(str(video_path), audio=False)
-    except (OSError, ValueError) as original_error:
-        print(f"WARNING: MoviePy could not read {video_path.name}: {original_error.__class__.__name__}")
-        print("Attempting a video-only remux to remove timecode/data streams...")
-
-    cache_directory = PROJECT_DIRECTORY / '.moviepy_cache'
-    cache_directory.mkdir(exist_ok=True)
-    cleaned_path = cache_directory / f'{video_path.stem}_video_only.mp4'
-    source_stat = video_path.stat()
-    needs_remux = (not cleaned_path.exists() or
-                   cleaned_path.stat().st_mtime_ns < source_stat.st_mtime_ns)
-
-    if needs_remux:
-        temporary_path = cache_directory / f'{video_path.stem}_working.mp4'
-        command = [
-            imageio_ffmpeg.get_ffmpeg_exe(), '-hide_banner', '-loglevel', 'error',
-            '-y', '-i', str(video_path), '-map', '0:v:0', '-an', '-sn', '-dn',
-            '-c:v', 'copy', '-map_metadata', '-1', '-movflags', '+faststart',
-            str(temporary_path),
-        ]
-        try:
-            subprocess.run(command, check=True, capture_output=True, text=True)
-            temporary_path.replace(cleaned_path)
-        except subprocess.CalledProcessError as error:
-            temporary_path.unlink(missing_ok=True)
-            raise RuntimeError(
-                f'Unable to clean {video_path.name}. FFmpeg reported:\n{error.stderr}'
-            ) from error
-
-    try:
-        cleaned_clip = VideoFileClip(str(cleaned_path), audio=False)
-    except Exception as error:
-        raise RuntimeError(
-            f'MoviePy still cannot open the cleaned copy of {video_path.name}: '
-            f'{cleaned_path}'
-        ) from error
-    print(f'Using cleaned background: {cleaned_path.name}')
-    return cleaned_clip
-
-
-def fit_background(source_clip):
-    # MoviePy/FFmpeg can report a duration that reaches one frame beyond the
-    # last decodable frame. Trim three source frames before resizing/looping.
-    # This does not re-encode the file or add a preprocessing pass.
-    source_fps = source_clip.fps or VIDEO_FPS
-    safe_end = source_clip.duration - BACKGROUND_END_TRIM_FRAMES / source_fps
-    if safe_end <= BACKGROUND_CROSSFADE_SECONDS:
-        raise ValueError('Background clip is too short after end-frame safety trim')
-    source_clip = source_clip.subclipped(0, safe_end)
-    scale_factor = max(VIDEO_SIZE[0] / source_clip.w, VIDEO_SIZE[1] / source_clip.h)
-    resized_clip = source_clip.resized(scale_factor)
-    return resized_clip.cropped(x_center=resized_clip.w / 2, y_center=resized_clip.h / 2, width=VIDEO_SIZE[0], height=VIDEO_SIZE[1]).without_audio()
-
-
-def build_background(background_sources, duration):
-    """Cycle through all six clips with crossfades and loop the resulting sequence."""
-    transition = BACKGROUND_CROSSFADE_SECONDS
-    prepared = [fit_background(source) for source in background_sources]
-    if any(clip.duration <= transition for clip in prepared):
-        raise ValueError('Every background clip must be longer than the crossfade duration')
-    sequence = []
-    for index, clip in enumerate(prepared):
-        # Fade in each clip except the first; overlapping clips create a crossfade.
-        if index:
-            from moviepy.video.fx import CrossFadeIn
-            clip = clip.with_effects([CrossFadeIn(transition)])
-        sequence.append(clip)
-    # Composite the clips at overlapping start times.
-    layers = []
-    position = 0.0
-    for clip in sequence:
-        layers.append(clip.with_start(position))
-        position += clip.duration - transition
-    cycle_duration = position + transition
-    cycle = CompositeVideoClip(layers, size=VIDEO_SIZE).with_duration(cycle_duration)
-    # A loop boundary is a hard cut; crossfades occur between successive source clips.
-    return cycle.with_effects([Loop(duration=duration)]).with_duration(duration)
-
-
 def ease_out(value):
-    """Cubic ease-out, for the upward entrance."""
+    
     return 1 - (1 - value) ** 3
 
 
 def ease_in(value):
-    """Cubic ease-in, for the upward exit."""
+    
     return value ** 3
 
 
 def add_overlay(overlays, image, start_time, duration, *, ascent=True, fade_only=False):
-    """Animate a transparent overlay without moving or fading the footage.
-
-    Entrance: rise from below while fading in. Exit: rise above while
-    fading out. Image position and alpha are evaluated at video time, so
-    no extra frames are rendered or encoded in advance.
-    """
+    
+    
+    
+    
+    
+    
     if duration <= 0:
         return
 
@@ -549,8 +384,8 @@ def add_overlay(overlays, image, start_time, duration, *, ascent=True, fade_only
         return 0.0, 1.0
 
     clip = clip.with_position(lambda t: (0, round(animation(t)[0])))
-    # Fade the existing transparency mask, not the RGB image. This preserves
-    # white text and the card's true white fill throughout the animation.
+    
+    
     if clip.mask is not None:
         animated_mask = clip.mask.transform(
             lambda get_frame, t: get_frame(t) * animation(t)[1]
@@ -559,218 +394,256 @@ def add_overlay(overlays, image, start_time, duration, *, ascent=True, fade_only
     overlays.append(clip.with_start(start_time))
 
 
-def build_timeline(sections, intro_narration, paragraph_narrations):
-    """Match each paragraph 1:1 with its narration, across section boundaries."""
-    overlays = []
-    audio_layers = [intro_narration.with_start(0)]
-    current_time = intro_narration.duration
-    add_overlay(overlays, create_intro_card(background=True, elements=False),
-                0, intro_narration.duration, ascent=False, fade_only=True)
-    add_overlay(overlays, create_intro_card(background=False, elements=True, title=False),
-                0, intro_narration.duration)
-    add_word_overlay(overlays, STORY_TITLE, 0, intro_narration.duration, intro_title=True)
-    current_time += INTRO_PAUSE_SECONDS
+def is_outro_marker(text):
+    return bool(re.fullmatch(
+        r'\s*(?:SECTION\s+\d+\s*:\s*)?OUTRO\s*[:.!-]?\s*',
+        text, flags=re.IGNORECASE
+    ))
 
-    narration_index = 0
-    total_paragraphs = sum(len(s['paragraphs']) for s in sections)
+
+def audio_duration(path):
+    clip = AudioFileClip(str(path))
+    try:
+        return clip.duration
+    finally:
+        clip.close()
+
+
+def create_manifest():
+    sections = parse_story(SCRIPT_PATH)
+    intro_path = AUDIO_DIRECTORY / 'intro.m4a'
+    if not intro_path.is_file():
+        raise FileNotFoundError(intro_path)
+    intro_duration = audio_duration(intro_path)
+    entries = [{'kind': 'intro', 'text': STORY_TITLE, 'start': 0.0,
+                'duration': intro_duration, 'audio': str(intro_path)}]
+    cursor = intro_duration + INTRO_PAUSE_SECONDS
+    paragraph_number = 0
+    expected = sum(len(section['paragraphs']) for section in sections)
     for section in sections:
-        # A heading is displayed only if at least one paragraph in this
-        # section has an audio file available.
-        if narration_index >= len(paragraph_narrations):
+        first_audio = AUDIO_DIRECTORY / f'audio{paragraph_number + 1}.m4a'
+        if not first_audio.is_file():
             break
-        # The OUTRO is audio-only: do not show its heading or reserve
-        # heading-screen time. The existing paragraph pause is preserved.
-        is_outro_section = section['heading'].strip().casefold() == 'OUTRO'
-        if not is_outro_section:
-            add_word_overlay(overlays, section['heading'], current_time,
-                             SECTION_HEADING_SECONDS, is_heading=True)
-            current_time += SECTION_HEADING_SECONDS
-
+        is_outro = is_outro_marker(section['heading'])
+        if not is_outro:
+            entries.append({'kind': 'heading', 'text': section['heading'],
+                            'start': cursor, 'duration': SECTION_HEADING_SECONDS})
+            cursor += SECTION_HEADING_SECONDS
         for paragraph in section['paragraphs']:
-            if narration_index >= len(paragraph_narrations):
+            path = AUDIO_DIRECTORY / f'audio{paragraph_number + 1}.m4a'
+            if not path.is_file():
                 break
-            narration = paragraph_narrations[narration_index]
-            narration_index += 1
-            paragraph_duration = narration.duration
-            # Both the visible paragraph and its audio start at precisely
-            # the same time and end after the audio's actual duration.
-            audio_layers.append(narration.with_start(current_time))
-            # The final paragraph is the spoken outro. Keep its audio,
-            # but leave the screen free for a separate outro page.
-            is_outro = narration_index == total_paragraphs
-            if not is_outro:
-                add_word_overlay(overlays, paragraph, current_time,
-                                 paragraph_duration)
-            current_time += paragraph_duration
-            # No trailing silence after the final narration.
-            if narration_index < len(paragraph_narrations):
-                current_time += PARAGRAPH_PAUSE_SECONDS
-
-    return overlays, CompositeAudioClip(audio_layers), current_time
+            duration = audio_duration(path)
+            entries.append({'kind': 'outro' if is_outro or is_outro_marker(paragraph) else 'paragraph',
+                            'text': paragraph, 'start': cursor,
+                            'duration': duration, 'audio': str(path)})
+            cursor += duration
+            paragraph_number += 1
+            if paragraph_number < expected and (AUDIO_DIRECTORY / f'audio{paragraph_number + 1}.m4a').is_file():
+                cursor += PARAGRAPH_PAUSE_SECONDS
+    if not paragraph_number:
+        raise FileNotFoundError('No audio1.m4a found')
+    if paragraph_number < expected:
+        print(f'WARNING: only {paragraph_number}/{expected} paragraph audio files exist.', flush=True)
+    return {'entries': entries, 'duration': cursor,
+            'fps': VIDEO_FPS, 'size': list(VIDEO_SIZE)}
 
 
-def render_video_segment(start_frame=None, end_frame=None, output_path=None):
-    sections = parse_story(SCRIPT_PATH)
-    # Audio numbering follows PARAGRAPHS, not sections. Example: if section 1
-    # has three paragraphs, audio1/audio2/audio3 belong to section 1;
-    # section 2 begins at audio4. Never estimate durations from word counts.
-    paragraph_count = sum(len(section['paragraphs']) for section in sections)
-    narration_paths = []
-    for paragraph_number in range(1, paragraph_count + 1):
-        narration_path = AUDIO_DIRECTORY / f'audio{paragraph_number}.m4a'
-        if not narration_path.is_file():
-            break
-        narration_paths.append(narration_path)
+def ffmpeg_source_duration(path, ffmpeg):
+    result = subprocess.run([ffmpeg, '-hide_banner', '-i', str(path)],
+                            capture_output=True, text=True)
+    match = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', result.stderr)
+    if not match:
+        raise RuntimeError(f'Cannot determine background duration: {path}\n{result.stderr[-1000:]}')
+    return int(match[1])*3600 + int(match[2])*60 + float(match[3])
 
-    if not narration_paths:
-        raise FileNotFoundError(
-            f'No paragraph narration found. Expected {AUDIO_DIRECTORY / "audio1.m4a"}'
-        )
-    if len(narration_paths) < paragraph_count:
-        print(
-            f'WARNING: story.txt has {paragraph_count} paragraphs, but only '
-            f'{len(narration_paths)} consecutive paragraph audio files were found. '
-            f'Rendering the first {len(narration_paths)} paragraphs only. '
-            'Remaining paragraphs and their section headings will be omitted.'
-        )
-    else:
-        print(f'Found {paragraph_count} paragraph audio files: 1:1 timing enabled.')
 
-    required_paths = [AUDIO_DIRECTORY / 'intro.m4a', *narration_paths, *(BACKGROUND_DIRECTORY / f'clip_{index}.mp4' for index in range(1, 7))]
-    for path in required_paths:
+def prepare_ffmpeg_background():
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    sources = [BACKGROUND_DIRECTORY / f'clip_{i}.mp4' for i in range(1, 7)]
+    for path in sources:
         if not path.is_file():
-            raise FileNotFoundError(f'Missing required asset: {path}')
-
-    opened_clips = []
-    final_video = None
+            raise FileNotFoundError(path)
+    cache = PROJECT_DIRECTORY / '.moviepy_cache'
+    cache.mkdir(exist_ok=True)
+    signature = json.dumps({'sources': [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in sources],
+                            'size': VIDEO_SIZE, 'fps': VIDEO_FPS, 'crossfade': BACKGROUND_CROSSFADE_SECONDS,
+                            'trim': BACKGROUND_END_TRIM_FRAMES, 'tint': STORY_DARKEN_ALPHA}, sort_keys=True)
+    digest = hashlib.sha256(signature.encode()).hexdigest()[:16]
+    target = cache / f'background_{digest}.mp4'
+    if target.is_file() and target.stat().st_size > 1000:
+        print('Using cached FFmpeg background:', target.name, flush=True)
+        return target
+    durations = [ffmpeg_source_duration(p, ffmpeg) - BACKGROUND_END_TRIM_FRAMES / VIDEO_FPS for p in sources]
+    transition = BACKGROUND_CROSSFADE_SECONDS
+    if any(d <= transition for d in durations):
+        raise ValueError('Background shorter than crossfade')
+    width, height = VIDEO_SIZE
+    filters = []
+    for i, duration in enumerate(durations):
+        filters.append(f'[{i}:v:0]trim=duration={duration:.6f},setpts=PTS-STARTPTS,'
+                       f'scale={width}:{height}:force_original_aspect_ratio=increase,'
+                       f'crop={width}:{height},fps={VIDEO_FPS},format=yuv420p[v{i}]')
+    prev = 'v0'
+    cumulative = durations[0]
+    for i in range(1, len(sources)):
+        offset = cumulative - transition
+        filters.append(f'[{prev}][v{i}]xfade=transition=fade:duration={transition}:offset={offset:.6f}[x{i}]')
+        prev = f'x{i}'
+        cumulative += durations[i] - transition
+    brightness = 1 - STORY_DARKEN_ALPHA / 255
+    filters.append(f'[{prev}]colorchannelmixer=rr={brightness:.6f}:gg={brightness:.6f}:bb={brightness:.6f},format=yuv420p[final]')
+    temporary = cache / f'background_{digest}.working.mp4'
+    command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y']
+    for source in sources:
+        command += ['-i', str(source)]
+    command += ['-filter_complex', ';'.join(filters), '-map', '[final]', '-an',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-threads', '2',
+                '-pix_fmt', 'yuv420p', str(temporary)]
+    print('Preprocessing FFmpeg background once...', flush=True)
     try:
-        intro_narration = AudioFileClip(str(required_paths[0]))
-        opened_clips.append(intro_narration)
-        paragraph_narrations = []
-        for path in narration_paths:
-            narration = AudioFileClip(str(path))
-            opened_clips.append(narration)
-            paragraph_narrations.append(narration)
-        background_sources = []
-        for index in range(1, 7):
-            clip = open_background_video(BACKGROUND_DIRECTORY / f'clip_{index}.mp4')
-            opened_clips.append(clip)
-            background_sources.append(clip)
+        subprocess.run(command, check=True)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
 
-        overlays, audio, total_duration = build_timeline(sections, intro_narration, paragraph_narrations)
-        background = build_background(background_sources, total_duration)
-        # A single constant-opacity black layer covers the entire video, including
-        # the intro, pauses, headings, and paragraphs. No sudden tint changes.
-        continuous_tint = ColorClip(size=VIDEO_SIZE, color=(0, 0, 0),
-                                    duration=total_duration).with_opacity(STORY_DARKEN_ALPHA / 255)
-        final_video = CompositeVideoClip([background, continuous_tint, *overlays],
-                                         size=VIDEO_SIZE).with_audio(audio)
-        if start_frame is not None:
-            # Frame-aligned boundaries prevent gaps or duplicated video frames.
-            start_time = start_frame / VIDEO_FPS
-            end_time = min(total_duration, end_frame / VIDEO_FPS)
-            if start_time >= total_duration:
-                raise ValueError('Segment begins after the end of the video')
-            segment = final_video.subclipped(start_time, end_time)
-        else:
-            segment = final_video
+
+def render_video_segment(start_frame, end_frame, output_path, manifest_path, background_path):
+    manifest = json.loads(Path(manifest_path).read_text(encoding='utf-8'))
+    duration = manifest['duration']
+    segment_start = start_frame / VIDEO_FPS
+    segment_end = min(duration, end_frame / VIDEO_FPS)
+    segment_duration = segment_end - segment_start
+    if segment_duration <= 0:
+        raise ValueError('Empty segment')
+    overlays = []
+    audio_layers = []
+    opened = []
+    foreground = None
+    mixed_audio = None
+    audio_path = Path(output_path).with_suffix('.audio.wav')
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    try:
+        for entry in manifest['entries']:
+            entry_start = entry['start']
+            entry_end = entry_start + entry['duration']
+            if entry_end <= segment_start or entry_start >= segment_end:
+                continue
+            kind = entry['kind']
+            local_start = entry_start - segment_start
+            if kind == 'intro':
+                add_overlay(overlays, create_intro_card(background=True, elements=False),
+                            local_start, entry['duration'], ascent=False, fade_only=True)
+                add_overlay(overlays, create_intro_card(background=False, elements=True, title=False),
+                            local_start, entry['duration'])
+                add_word_overlay(overlays, STORY_TITLE, local_start, entry['duration'], intro_title=True)
+            elif kind == 'heading':
+                add_word_overlay(overlays, entry['text'], local_start,
+                                 entry['duration'], is_heading=True)
+            elif kind == 'paragraph':
+                add_word_overlay(overlays, entry['text'], local_start, entry['duration'])
+            if 'audio' in entry:
+                clip = AudioFileClip(entry['audio'])
+                opened.append(clip)
+                trim_start = max(0.0, segment_start - entry_start)
+                trim_end = min(clip.duration, segment_end - entry_start)
+                if trim_end > trim_start:
+                    audio_layers.append(clip.subclipped(trim_start, trim_end).with_start(max(0, local_start)))
+        mixed_audio = CompositeAudioClip(audio_layers).with_duration(segment_duration)
+        mixed_audio.write_audiofile(str(audio_path), fps=24000, nbytes=2,
+                                    codec='pcm_s16le', logger=None)
+        foreground = (CompositeVideoClip(overlays, size=VIDEO_SIZE, bg_color=None)
+                      if overlays else ImageClip(np.zeros((VIDEO_SIZE[1], VIDEO_SIZE[0], 4), dtype=np.uint8), transparent=True))
+        foreground = foreground.with_duration(segment_duration)
+        width, height = VIDEO_SIZE
+        frame_count = end_frame - start_frame
+        command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
+                   '-stream_loop', '-1', '-ss', f'{segment_start:.6f}', '-i', str(background_path),
+                   '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', f'{width}x{height}',
+                   '-r', str(VIDEO_FPS), '-i', 'pipe:0', '-i', str(audio_path),
+                   '-filter_complex', '[0:v][1:v]overlay=shortest=1:format=auto,format=yuv420p[v]',
+                   '-map', '[v]', '-map', '2:a:0', '-frames:v', str(frame_count),
+                   '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
+                   '-threads', str(ENCODER_THREADS_PER_WORKER),
+                   '-c:a', 'aac', '-b:a', '192k', '-shortest', str(output_path)]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            segment.write_videofile(
-                str(output_path or OUTPUT_PATH), fps=VIDEO_FPS, codec='libx264',
-                audio_codec='aac', preset='ultrafast', threads=ENCODER_THREADS_PER_WORKER,
-                ffmpeg_params=['-crf', '18'], logger='bar',
-            )
+            for frame_index in range(frame_count):
+                t = frame_index / VIDEO_FPS
+                rgb = foreground.get_frame(t)
+                alpha = (np.clip(foreground.mask.get_frame(t), 0, 1) * 255).astype(np.uint8)
+                rgba = np.empty((height, width, 4), dtype=np.uint8)
+                rgba[:, :, :3] = rgb[:, :, :3]
+                rgba[:, :, 3] = alpha
+                process.stdin.write(rgba.tobytes())
+            process.stdin.close()
+            error = process.stderr.read().decode(errors='replace')
+            if process.wait() != 0:
+                raise RuntimeError(f'FFmpeg segment failed: {error[-3000:]}')
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            raise
         finally:
-            if segment is not final_video:
-                segment.close()
+            process.stderr.close()
     finally:
-        if final_video is not None:
-            final_video.close()
-        for clip in opened_clips:
+        if foreground is not None:
+            foreground.close()
+        if mixed_audio is not None:
+            mixed_audio.close()
+        for clip in opened:
             clip.close()
-
-
-def get_total_duration():
-    """Inspect audio lengths without decoding video or creating any overlays."""
-    sections = parse_story(SCRIPT_PATH)
-    count = sum(len(section['paragraphs']) for section in sections)
-    clips = []
-    try:
-        intro = AudioFileClip(str(AUDIO_DIRECTORY / 'intro.m4a'))
-        clips.append(intro)
-        total = intro.duration + INTRO_PAUSE_SECONDS
-        n = 0
-        for section in sections:
-            if n >= count or not (AUDIO_DIRECTORY / f'audio{n+1}.m4a').exists():
-                break
-            if section['heading'].strip().casefold() != 'outro':
-                total += SECTION_HEADING_SECONDS
-            for _ in section['paragraphs']:
-                path = AUDIO_DIRECTORY / f'audio{n+1}.m4a'
-                if not path.exists():
-                    return total
-                clip = AudioFileClip(str(path))
-                clips.append(clip)
-                total += clip.duration
-                n += 1
-                if n < count and (AUDIO_DIRECTORY / f'audio{n+1}.m4a').is_file():
-                    total += PARAGRAPH_PAUSE_SECONDS
-        return total
-    finally:
-        for clip in clips:
-            clip.close()
+        audio_path.unlink(missing_ok=True)
 
 
 def main():
-    if PARALLEL_RENDER_WORKERS <= 1:
-        render_video_segment()
-        return
-    duration = get_total_duration()
-    total_frames = int(np.ceil(duration * VIDEO_FPS))
-    chunk_frames = max(VIDEO_FPS, int(RENDER_CHUNK_SECONDS * VIDEO_FPS))
-    ranges = [(i, min(i + chunk_frames, total_frames))
-              for i in range(0, total_frames, chunk_frames)]
-    if len(ranges) == 1:
-        render_video_segment()
-        return
+    manifest = create_manifest()
+    background = prepare_ffmpeg_background()
+    total_frames = math.ceil(manifest['duration'] * VIDEO_FPS)
+    chunk_frames = max(VIDEO_FPS, round(RENDER_CHUNK_SECONDS * VIDEO_FPS))
+    ranges = [(i, min(i + chunk_frames, total_frames)) for i in range(0, total_frames, chunk_frames)]
     temp_dir = PROJECT_DIRECTORY / '.render_segments'
     temp_dir.mkdir(exist_ok=True)
+    manifest_path = temp_dir / 'timeline.json'
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     paths = [temp_dir / f'part_{i:04d}.mp4' for i in range(len(ranges))]
     print(f'Rendering {len(paths)} segments with {PARALLEL_RENDER_WORKERS} workers.', flush=True)
 
     def run_worker(index):
         a, b = ranges[index]
-        command = [sys.executable, str(Path(__file__).resolve()),
-                   '--render-segment', str(a), str(b), str(paths[index])]
-        # Avoid multiple progress bars fighting for the same terminal.
-        with (temp_dir / f'part_{index:04d}.log').open('w', encoding='utf-8') as log:
+        command = [sys.executable, str(Path(__file__).resolve()), '--render-segment',
+                   str(a), str(b), str(paths[index]), str(manifest_path), str(background)]
+        log_path = temp_dir / f'part_{index:04d}.log'
+        with log_path.open('w', encoding='utf-8') as log:
             result = subprocess.run(command, cwd=str(PROJECT_DIRECTORY), stdout=log,
                                     stderr=subprocess.STDOUT, check=False)
         if result.returncode:
-            raise RuntimeError(f'Segment {index} failed; see {temp_dir / f"part_{index:04d}.log"}')
+            raise RuntimeError(f'Segment {index} failed; see {log_path}')
         print(f'Completed segment {index + 1}/{len(paths)}', flush=True)
 
-    with ThreadPoolExecutor(max_workers=PARALLEL_RENDER_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, PARALLEL_RENDER_WORKERS)) as pool:
         futures = [pool.submit(run_worker, i) for i in range(len(paths))]
         for future in as_completed(futures):
             future.result()
-
-    # Stream-copy concat: no additional video encoding pass.
     concat_list = temp_dir / 'concat.txt'
     concat_list.write_text(''.join(f"file '{p.name}'\n" for p in paths), encoding='utf-8')
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
                     '-f', 'concat', '-safe', '0', '-i', str(concat_list),
                     '-c', 'copy', str(OUTPUT_PATH)], check=True)
-
     print(f'Finished: {OUTPUT_PATH}', flush=True)
     print(f'Temporary segments preserved at: {temp_dir}', flush=True)
-    shutil.rmtree(temp_dir)
 
 
 if __name__ == '__main__':
-    # print(*parse_story(SCRIPT_PATH), sep = "\n\n")
-    if len(sys.argv) == 5 and sys.argv[1] == '--render-segment':
-        render_video_segment(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]))
+    import generate_audio_parallel as gap
+    import shutil
+    shutil.rmtree("assets\\audios")
+    gap.main()
+    if len(sys.argv) == 7 and sys.argv[1] == '--render-segment':
+        render_video_segment(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]),
+                             Path(sys.argv[5]), Path(sys.argv[6]))
     else:
         main()

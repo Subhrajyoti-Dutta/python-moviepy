@@ -1,13 +1,3 @@
-"""Generate Reddit Stories narration using up to 8 concurrent Edge TTS tasks.
-
-Install: python -m pip install edge-tts imageio-ffmpeg
-Run:     python generate_audio_parallel.py
-
-Reads assets/story.txt with SECTION N: headings and blank-line-separated paragraphs.
-Introduction is text before SECTION 1 or assets/intro.txt.
-Writes assets/audios/intro.m4a, audio1.m4a, audio2.m4a, ...
-No Azure credentials required. Requires internet connectivity.
-"""
 import asyncio
 import re
 import subprocess
@@ -21,10 +11,10 @@ STORY_FILE = ROOT / 'assets' / 'story.txt'
 INTRO_FILE = ROOT / 'assets' / 'intro.txt'
 AUDIO_DIR = ROOT / 'assets' / 'audios'
 
-VOICE = 'en-US-AvaNeural'  # American English female
-RATE = '-5%'  # Approximately 0.95x
-PITCH = '+10Hz'  # Normal pitch
-OVERWRITE = False  # Set True to regenerate existing narration
+VOICE = 'en-US-AvaNeural'
+RATE = '-5%'
+PITCH = '+10Hz'
+OVERWRITE = False
 MAX_CONCURRENT = 8
 RETRIES = 3
 RETRY_DELAY_SECONDS = 3
@@ -39,7 +29,7 @@ def parse_narration(path):
     if not matches:
         raise ValueError('No SECTION N: headings found in assets/story.txt')
 
-    preface = story[:matches[0].start()].strip()
+    preface = story[:matches[0].start()].strip().replace("INTRODUCTION", "")
     if preface:
         intro = preface
     elif INTRO_FILE.is_file():
@@ -88,7 +78,6 @@ async def synthesize(name, content, ffmpeg):
                 print(f'Retrying {name} ({attempt}/{RETRIES}): {error}', flush=True)
                 await asyncio.sleep(RETRY_DELAY_SECONDS * attempt)
 
-        # FFmpeg conversion is blocking, so run it in a worker thread.
         await asyncio.to_thread(
             subprocess.run,
             [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
@@ -104,7 +93,7 @@ async def synthesize(name, content, ffmpeg):
         temporary_m4a.unlink(missing_ok=True)
 
 
-async def main():
+async def _main():
     entries = parse_narration(STORY_FILE)
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -127,6 +116,9 @@ async def main():
         raise RuntimeError(f'Audio generation failed for: {", ".join(failed)}. Rerun to retry missing files.')
     print('Done. Run python main.py to render your video.', flush=True)
 
+def main():
+    asyncio.run(_main())
+
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
